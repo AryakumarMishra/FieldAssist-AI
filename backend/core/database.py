@@ -69,5 +69,13 @@ def get_session_messages(session_id: str):
     conn.close()
     return [dict(row) for row in rows]
 
+def delete_session(session_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
 # Initialize on import
 init_db()

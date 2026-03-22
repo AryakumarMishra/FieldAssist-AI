@@ -4,6 +4,8 @@ import os
 import uuid
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -11,7 +13,7 @@ from .schema.chat_schema import ChatInput
 from .schema.history_schema import ChatSessionCreate
 from .core.retriever import retrieve_documents
 from .core.get_llm import get_llm
-from .core.database import create_session, get_all_sessions, add_message, get_session_messages
+from .core.database import create_session, get_all_sessions, add_message, get_session_messages, delete_session
 
 # loading environment variables
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,19 +50,28 @@ async def fetch_chat_messages(session_id: str):
     return get_session_messages(session_id)
 
 
+@app.delete("/chats/{session_id}")
+async def remove_chat(session_id: str):
+    """Deletes a chat session and all its messages natively"""
+    delete_session(session_id)
+    return {"status": "success", "session_id": session_id}
+
+
 @app.post("/chat")
 async def chat_with_doc(request: ChatInput):
-    """Chat with the document"""
+    """Chat with the document (Streams Response)"""
     if request.session_id:
         add_message(request.session_id, "user", request.query)
         
     retriever = retrieve_documents(query=request.query, category=request.category)
 
     if not retriever:
-        return {
-            "message": "No documents found",
-            "answer": "No documents found"
-        }
+        async def mock_stream():
+            msg = "I cannot find the relevant information in the provided document. Please consult the official manual."
+            yield msg
+            if request.session_id:
+                add_message(request.session_id, "assistant", msg)
+        return StreamingResponse(mock_stream(), media_type="text/plain")
 
     context = "\n\n".join(retriever)
 
@@ -98,12 +109,19 @@ async def chat_with_doc(request: ChatInput):
     )
 
     llm = get_llm()
-    llm_response = llm.invoke(final_prompt)
 
-    if request.session_id:
-        add_message(request.session_id, "assistant", llm_response.content)
+    async def generate_response():
+        full_response = ""
+        # Native langchain stream iterable
+        for chunk in llm.stream(final_prompt):
+            content = chunk.content
+            full_response += content
+            yield content
+        
+        # Suffix the source documents so the UI can parse them
+        yield "\n__SOURCES_JSON__" + json.dumps(retriever) + "__END_SOURCES__"
 
-    return {
-        "answer": llm_response.content,
-        "source_documents": retriever
-    }
+        if request.session_id:
+            add_message(request.session_id, "assistant", full_response)
+
+    return StreamingResponse(generate_response(), media_type="text/plain")

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Send, MessageSquare, Plus } from 'lucide-react';
+import { Send, MessageSquare, Plus, Trash2 } from 'lucide-react';
 import './index.css';
 
 const API_BASE = 'http://localhost:8000'; // FastAPI configuration
@@ -15,7 +15,6 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
-  // Initial load
   useEffect(() => {
     fetchSessions();
   }, []);
@@ -41,6 +40,7 @@ function App() {
     setActiveSession(session);
     try {
       const res = await axios.get(`${API_BASE}/chats/${session.id}/messages`);
+      // Parse historical source documents if we stored them (historically we didn't, but going forward we just store raw content)
       setMessages(res.data);
     } catch (err) {
       console.error('Failed to load messages', err);
@@ -51,6 +51,19 @@ function App() {
     setActiveSession(null);
     setMessages([]);
     setInputStr('');
+  };
+
+  const handleDeleteSession = async (e, sessionId) => {
+    e.stopPropagation(); // prevent triggering the chat load
+    try {
+      await axios.delete(`${API_BASE}/chats/${sessionId}`);
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (activeSession?.id === sessionId) {
+        startNewChat();
+      }
+    } catch (err) {
+      console.error('Failed to delete chat:', err);
+    }
   };
 
   const handleSend = async () => {
@@ -66,10 +79,13 @@ function App() {
     let currentSessionId = activeSession?.id;
     let category = activeSession ? activeSession.category : selectedCategory;
 
+    // Create boundary for the streaming message
+    const assistantId = Date.now() + 1;
+    setMessages(prev => [...prev, { id: assistantId, role: 'assistant', content: '', source_documents: [] }]);
+
     try {
       // Create session if it's the first message
       if (!currentSessionId) {
-        // Title can be the first few words of the query
         const title = query.length > 30 ? query.substring(0, 30) + '...' : query;
         const res = await axios.post(`${API_BASE}/chats`, {
           title: title,
@@ -81,25 +97,58 @@ function App() {
         setSessions(prev => [newSessionObj, ...prev]);
       }
 
-      // Send to LLM
-      const res = await axios.post(`${API_BASE}/chat`, {
-        query: query,
-        category: category,
-        session_id: currentSessionId
+      // Stream the LLM response using native Fetch API
+      const response = await fetch(`${API_BASE}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: query,
+          category: category,
+          session_id: currentSessionId
+        })
       });
 
-      const assistantMsg = {
-        id: Date.now() + 1,
-        role: 'assistant',
-        content: res.data.answer,
-        source_documents: res.data.source_documents
-      };
+      if (!response.body) throw new Error('ReadableStream not supported.');
 
-      setMessages(prev => [...prev, assistantMsg]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let done = false;
+      let streamedText = "";
+
+      // Remove the spinning loader as soon as the connection opens
+      setIsLoading(false);
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          streamedText += chunk;
+          
+          let displayContent = streamedText;
+          let sources = [];
+          
+          // Detect sources boundary securely
+          if (streamedText.includes('__SOURCES_JSON__')) {
+            const parts = streamedText.split('__SOURCES_JSON__');
+            displayContent = parts[0];
+            const sourcesRaw = parts[1].split('__END_SOURCES__')[0];
+            try {
+              sources = JSON.parse(sourcesRaw);
+            } catch (e) {}
+          }
+
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantId ? { ...msg, content: displayContent, source_documents: sources } : msg
+          ));
+        }
+      }
+
     } catch (err) {
       console.error('Chat error:', err);
-      // Let the user know the backend couldn't be reached
-      setMessages(prev => [...prev, { id: Date.now(), role: 'assistant', content: 'An error occurred while connecting to the backend. Ensure FastAPI is running on port 8000.' }]);
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantId ? { ...msg, content: 'An error occurred while connecting to the backend.' } : msg
+      ));
     } finally {
       setIsLoading(false);
     }
@@ -116,14 +165,24 @@ function App() {
         </div>
         <div className="chat-list">
           {sessions.map(s => (
-            <button 
+            <div 
               key={s.id} 
               className={`chat-item ${activeSession?.id === s.id ? 'active' : ''}`}
               onClick={() => loadSession(s)}
+              style={{flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between'}}
             >
-              <span className="chat-title"><MessageSquare size={14} style={{marginRight: '6px', verticalAlign: 'middle'}}/> {s.title || 'Untitled'}</span>
-              <span className="chat-category">{s.category.replace('_', ' ')}</span>
-            </button>
+              <div style={{display: 'flex', flexDirection: 'column', gap: '4px', overflow: 'hidden'}}>
+                <span className="chat-title"><MessageSquare size={14} style={{marginRight: '6px', verticalAlign: 'middle'}}/> {s.title || 'Untitled'}</span>
+                <span className="chat-category">{s.category.replace('_', ' ')}</span>
+              </div>
+              <button 
+                onClick={(e) => handleDeleteSession(e, s.id)}
+                style={{background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '4px'}}
+                title="Delete Chat"
+              >
+                <Trash2 size={16} />
+              </button>
+            </div>
           ))}
         </div>
       </aside>
