@@ -11,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from .schema.chat_schema import ChatInput
 from .schema.history_schema import ChatSessionCreate
-from .core.retriever import retrieve_documents
+from .core.retriever import retrieve_documents, contextualize_query
 from .core.get_llm import get_llm
 from .core.database import create_session, get_all_sessions, add_message, get_session_messages, delete_session
 
@@ -60,10 +60,14 @@ async def remove_chat(session_id: str):
 @app.post("/chat")
 async def chat_with_doc(request: ChatInput):
     """Chat with the document (Streams Response)"""
+
+    history = get_session_messages(request.session_id) if request.session_id else []
+
     if request.session_id:
         add_message(request.session_id, "user", request.query)
-        
-    retriever = retrieve_documents(query=request.query, category=request.category)
+
+    retrieval_query = contextualize_query(request.query, history)
+    retriever = retrieve_documents(query=retrieval_query, category=request.category)
 
     if not retriever:
         async def mock_stream():
@@ -75,28 +79,54 @@ async def chat_with_doc(request: ChatInput):
 
     context = "\n\n".join(retriever)
 
-    # prompt for the llm
+
+    history_text = ""
+    if history:
+        recent = history[-6:]  # last 3 turns (user + assistant pairs)
+        history_text = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in recent
+        )
+
+
     system_prompt = (
-        "You are FieldAssist AI, a highly secure, offline-first AI assistant designed to provide accurate, privacy-preserving legal and procedural guidance.\n\n"
+        "You are FieldAssist AI, a highly secure, offline-first AI assistant that provides accurate, "
+        "privacy-preserving legal and procedural guidance based strictly on the Bharatiya Nyaya Sanhita (BNS) 2023 "
+        "and other official documents.\n\n"
+
         "STRICT RULES:\n"
-        "1. You must base your answers SOLELY on the provided context block below.\n"
-        "2. Do NOT use outside knowledge, internet sources, or prior training data. Client privacy and data security are paramount.\n"
-        "3. If the answer exists in the context, extract and summarize it concisely.\n"
-        "4. If the context does not contain the answer, ONLY reply 'I cannot find the relevant information in the provided document. Please consult the official manual.'\n"
-        "5. Every claim MUST be supported by the context.\n"
-        "6. When quoting laws, sections, or military/medical procedures, be highly precise.\n\n"
-        "Answer Guidelines:\n"
-        "- Answer the question professionally and objectively.\n"
-        "- Keep responses to 3-5 concise sentences unless detailed steps are required.\n"
-        "- Focus on technical and legal specificity.\n\n"
-        "Required Output Format:\n"
-        "Answer: <concise, context-grounded answer>\n"
-        "Supporting Context: <exact excerpts used>\n\n"
-        "CONTEXT:\n"
+        "1. Base your answers SOLELY on the CONTEXT block provided below.\n"
+        "2. Do NOT use outside knowledge, internet sources, or prior training data.\n"
+        "3. If the answer is in the context, extract and summarize it clearly and concisely.\n"
+        "4. If the context does not contain a sufficient answer, reply ONLY: "
+        "'I cannot find the relevant information in the provided document. Please consult the official manual.'\n"
+        "5. Every legal claim MUST cite the specific BNS section number from the context.\n"
+        "6. When the user asks a follow-up question (e.g., 'what should I do next?'), "
+        "use the CONVERSATION HISTORY to understand what situation they are referring to, "
+        "then answer in that context using the retrieved documents.\n\n"
+
+        "ANSWER GUIDELINES:\n"
+        "- Be practical and direct. If the user is describing a situation they experienced, "
+        "explain what offence occurred, which section applies, and what their immediate options are.\n"
+        "- Do not just recite raw legal text. Interpret it for the user's situation.\n"
+        "- Keep responses to 4-6 sentences unless detailed steps are required.\n"
+        "- For victim scenarios: mention (1) the applicable offence & section, "
+        "(2) the practical step (e.g., file FIR at nearest police station), "
+        "(3) cognizability and bailability if available in context.\n\n"
+
+        "OUTPUT FORMAT:\n"
+        "Answer: <clear, practical, context-grounded answer with section references>\n"
+        "Supporting Context: <brief exact excerpt(s) from context that support the answer>\n\n"
+
+        "CONVERSATION HISTORY (for follow-up context only — do not answer from this):\n"
+        "{history}\n\n"
+
+        "CONTEXT (answer ONLY from this):\n"
         "{context}"
     )
 
-    human_prompt = "{query}"
+    human_prompt = "User's current question: {query}"
+
 
     chat_template = ChatPromptTemplate.from_messages([
         {"role": "system", "content": system_prompt},
@@ -105,6 +135,7 @@ async def chat_with_doc(request: ChatInput):
 
     final_prompt = chat_template.format_messages(
         context=context,
+        history=history_text if history_text else "No prior conversation.",
         query=request.query
     )
 
@@ -112,13 +143,11 @@ async def chat_with_doc(request: ChatInput):
 
     async def generate_response():
         full_response = ""
-        # Native langchain stream iterable
         for chunk in llm.stream(final_prompt):
             content = chunk.content
             full_response += content
             yield content
-        
-        # Suffix the source documents so the UI can parse them
+
         yield "\n__SOURCES_JSON__" + json.dumps(retriever) + "__END_SOURCES__"
 
         if request.session_id:
